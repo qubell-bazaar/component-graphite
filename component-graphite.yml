@@ -1,0 +1,130 @@
+application:
+  configuration:
+    input.image: { "ami": "us-east-1/ami-8997afe0", "user": "root", "type": "linux", "hw": "m1.small" }
+    input.image-prefix: "Graphite"
+    input.recipe-url: "https://dl.dropboxusercontent.com/u/250836/graphite.tar.gz"
+    input.web-credentials: {"login": "graphite", "password": "123QweAsd"}
+  interfaces:
+    input:
+      image: bind(graphite#input.image)
+      image-prefix: bind(graphite#input.image-prefix)
+      recipe-url: bind(graphite#input.recipe-url)
+      web-credentials: bind(graphite#input.web-credentials)
+    graphite:
+      host: bind(graphite#result.graphite-host)
+      web-ui: bind(graphite#result.graphite-UI)
+      init-agent: "bind(graphite#actions.init-agent)"
+  components:
+    graphite:
+      type: workflow.Instance
+      interfaces:
+        input:
+          image: configuration(map<string, object>)
+          image-prefix: configuration(string)
+          recipe-url: configuration(string)
+          web-credentials: configuration(map<string, object>)
+        actions:
+          init-agent:
+            type: receive-command(list<string> agent-hosts, string identity)
+            name: Initialize agent host
+            arguments:
+              agent-hosts:
+                name: Hosts IPs to setup graphite agent
+              identity:
+                name: SSH user to graphite agent hosts
+        result:
+          graphite-host:
+            type: publish-signal(string)
+            name: Graphite Host
+          graphite-UI:
+            type: publish-signal(string)
+            name: Graphite UI
+      configuration:
+        configuration.workflows:
+          launch: 
+            steps:
+              - provision:
+                  action: provisionVms
+                  parameters:
+                    hardwareId: "{$.image.hw}"
+                    imageId: "{$.image.ami}"
+                    vmIdentity: "{$.image.user}"
+                    jcloudsNodeNamePrefix: "{$.image-prefix}"
+                    roleName: default
+                  output:
+                    ips: ips
+              - set-hostname: 
+                  action: execrun
+                  precedingPhases: [ provision ]
+                  parameters:
+                    roles: [ default ]
+                    command:
+                      - bash
+                      - "-c"
+                      - |
+                        hostname `curl -s http://169.254.169.254/latest/meta-data/public-hostname` &&
+                        echo "`hostname -i`   `hostname` `hostname -s`" >> /etc/hosts &&
+                        hostname
+                  output:
+                    dns: stdout
+              - generate-secret:
+                  action: execrun
+                  precedingPhases: [ set-hostname ]
+                  parameters:
+                    roles: [ default ]
+                    command:
+                      - openssl rand -hex 10
+                  output:
+                    secret: stdout
+              - install-graphite:
+                  action: chefsolo
+                  precedingPhases: [ generate-secret ]
+                  parameters:
+                    version: "11.16.4"
+                    retryCount: 3
+                    roles: [ default ]
+                    recipeUrl: "{$.recipe-url}"
+                    runList: [ "recipe[qubell_graphite]" ]
+                    jattrs:
+                      graphite:
+                        user: "{$.web-credentials.login}"
+                        password: "{$.web-credentials.password}"
+                        listen_port: 8080
+                        uwsgi:
+                          listen_http: true
+                      memcached:
+                        listen: "127.0.0.1"
+                        port: 11211
+                        udp_port: 11211
+                      qubell_graphite:
+                        secret_key: "{$.secret}"
+            return:
+              graphite-host: 
+                value: "{$.dns[*][0]}"
+              graphite-UI:
+                value: "http://{$.dns[*][0]}:8080"
+
+          init-agent:
+            steps:
+              - provision:
+                  action: provisionVms
+                  parameters:
+                    hardwareId: ""
+                    vmIdentity: "{$.identity}"
+                    staticIps: "{$.agent-hosts}"
+                    roleName: graphite-agent
+                  output:
+                    ips: ips
+              - install-graphite-agent:
+                  action: chefsolo
+                  precedingPhases: [ provision ]
+                  parameters:
+                    isSudo: false
+                    version: "11.16.4-1"
+                    roles: [graphite-agent]
+                    recipeUrl: "{$.recipe-url}"
+                    runList: [ "recipe[qubell_graphite::agent]" ]
+                    jattrs:
+                      qubell_graphite:
+                        carbon_host: "{$.graphite-host}"
+                        carbon_port: 2003
